@@ -16,7 +16,7 @@
  */
 #include "bim.h"
 
-#define BIM_VERSION   "3.0.0" TAG
+#define BIM_VERSION   "3.1.0" TAG
 #define BIM_COPYRIGHT "Copyright 2012-2021 K. Lange <\033[3mklange@toaruos.org\033[23m>"
 
 #include <kuroko/kuroko.h>
@@ -42,6 +42,7 @@ global_config_t global_config = {
 	.command_offset = 0,
 	.command_col_no = 0,
 	.history_point = -1,
+	.search_point = -1,
 	/* Bitset starts here */
 	.highlight_on_open = 1,
 	.initial_file_is_read_only = 0,
@@ -4568,19 +4569,72 @@ BIM_ACTION(leave_insert, 0,
 		redraw_commandline();
 }
 
+struct MatchQualifier {
+	int (*matchFunc)(struct MatchQualifier*,uint32_t,int);
+	union {
+		uint32_t matchChar;
+		struct {
+			uint32_t * start;
+			uint32_t * end;
+		} matchSquares;
+	};
+};
+
 /**
  * Helper for handling smart case sensitivity.
  */
-int search_matches(uint32_t a, uint32_t b, int mode) {
+int match_char(struct MatchQualifier * self, uint32_t b, int mode) {
 	if (mode == 0) {
-		return a == b;
+		return self->matchChar == b;
 	} else if (mode == 1) {
-		return tolower(a) == tolower(b);
+		return tolower(self->matchChar) == tolower(b);
 	}
 	return 0;
 }
 
-int subsearch_matches(line_t * line, int j, uint32_t * needle, int ignorecase, int *len) {
+int match_squares(struct MatchQualifier * self, uint32_t c, int mode) {
+	uint32_t * start = self->matchSquares.start;
+	uint32_t * end = self->matchSquares.end;
+	uint32_t * t = start;
+	int good = 1;
+	if (*t == '^') { t++; good = 0; }
+	while (t != end) {
+		uint32_t test = *t++;
+		if (test == '\\' && *t && strchr("\\]",*t)) {
+			test = *t++;
+		} else if (test == '\\' && *t == 't') {
+			test = '\t'; t++;
+		}
+
+		if (*t == '-') {
+			t++;
+			if (t == end) return 0;
+			uint32_t right = *t++;
+			if (right == '\\' && *t && strchr("\\]",*t)) {
+				right = *t++;
+			} else if (right == '\\' && *t == 't') {
+				right = '\t'; t++;
+			}
+			if (mode ? (tolower(c) >= tolower(test) && tolower(c) <= tolower(right)) : (c >= test && c <= right)) return good;
+		} else {
+			if (mode ? (tolower(c) == tolower(test)) : (c == test)) return good;
+		}
+	}
+	return !good;
+}
+
+int match_dot(struct MatchQualifier * self, uint32_t c, int mode) {
+	return 1;
+}
+
+struct BackRef {
+	int start;
+	int len;
+	uint32_t * copy;
+};
+
+#define MAX_REFS 10
+int regex_matches(line_t * line, int j, uint32_t * needle, int ignorecase, int *len, uint32_t **needleout, int refindex, struct BackRef * refs) {
 	int k = j;
 	uint32_t * match = needle;
 	if (*match == '^') {
@@ -4588,7 +4642,13 @@ int subsearch_matches(line_t * line, int j, uint32_t * needle, int ignorecase, i
 		match++;
 	}
 	while (k < line->actual + 1) {
+		if (needleout && *match == ')') {
+			*needleout = match + 1;
+			if (len) *len = k - j;
+			return 1;
+		}
 		if (*match == '\0') {
+			if (needleout) return 0;
 			if (len) *len = k - j;
 			return 1;
 		}
@@ -4597,72 +4657,123 @@ int subsearch_matches(line_t * line, int j, uint32_t * needle, int ignorecase, i
 			match++;
 			continue;
 		}
+		if (k == line->actual) break;
+
+		struct MatchQualifier matcher = {match_char, .matchChar=*match};
 		if (*match == '.') {
-			if (match[1] == '*') {
-				int greedy = !(match[2] == '?');
-				/* Short-circuit chained .*'s */
-				if (match[greedy ? 2 : 3] == '.' && match[greedy ? 3 : 4] == '*') {
-					int _len;
-					if (subsearch_matches(line, k, &match[greedy ? 2 : 3], ignorecase, &_len)) {
-						if (len) *len = _len + k - j;
-						return 1;
-					}
-					return 0;
-				}
-				int _j = greedy ? line->actual : k;
-				int _break = -1;
-				int _len = -1;
-				if (!match[greedy ? 2 : 3]) {
-					_len = greedy ? (line->actual - _j) : 0;
-					_break = _j;
-				} else {
-					while (_j < line->actual + 1 && _j >= k) {
-						int len;
-						if (subsearch_matches(line, _j, &match[greedy ? 2 : 3], ignorecase, &len)) {
-							_break = _j;
-							_len = len;
-							break;
-						}
-						_j += (greedy ? -1 : 1);
-					}
-				}
-				if (_break != -1) {
-					if (len) *len = (_break - j) + _len;
+			matcher.matchFunc = match_dot;
+			match++;
+		} else if (*match == '\\' && strchr("$^/\\.[?]*+()",match[1]) != NULL) {
+			matcher.matchChar = match[1];
+			match += 2;
+		} else if (*match == '\\' && match[1] == 't') {
+			matcher.matchChar = '\t';
+			match += 2;
+		} else if (*match == '[') {
+			uint32_t * s = match+1;
+			uint32_t * e = s;
+			while (*e && *e != ']') {
+				if (*e == '\\' && e[1] == ']') e++;
+				e++;
+			}
+			if (!*e) break; /* fail match on unterminated [] sequence */
+			match = e + 1;
+			matcher.matchFunc = match_squares;
+			matcher.matchSquares.start = s;
+			matcher.matchSquares.end = e;
+		} else if (*match == '(') {
+			match++;
+			int _len;
+			uint32_t * newmatch;
+			if (!regex_matches(line, k, match, ignorecase, &_len, &newmatch, 0, NULL)) break;
+			match = newmatch;
+			if (refindex && refindex < MAX_REFS) {
+				refs[refindex].start = k;
+				refs[refindex].len = _len;
+				refindex++;
+			}
+			k += _len;
+			continue;
+		} else {
+			match++;
+		}
+		if (*match == '?') {
+			/* Optional */
+			match++;
+			if (matcher.matchFunc(&matcher, line->text[k].codepoint, ignorecase)) {
+				int _len;
+				if (regex_matches(line,k+1,match,ignorecase,&_len, needleout, refindex, refs)) {
+					if (len) *len = _len + k + 1 - j;
 					return 1;
 				}
-				return 0;
-			} else {
-				if (k >= line->actual) return 0;
-				match++;
-				k++;
-				continue;
 			}
-		}
-		if (*match == '\\' && (match[1] == '$' || match[1] == '^' || match[1] == '/' || match[1] == '\\' || match[1] == '.')) {
-			match++;
-		} else if (*match == '\\' && match[1] == 't') {
-			if (line->text[k].codepoint != '\t') break;
-			match += 2;
-			k++;
 			continue;
+		} else if (*match == '+' || *match == '*') {
+			/* Must match at least one */
+			if (*match == '+') {
+				if (!matcher.matchFunc(&matcher, line->text[k].codepoint, ignorecase)) break;
+				k++;
+			}
+			/* Match any */
+			match++;
+			int greedy = 1;
+			if (*match == '?') {
+				/* non-greedy */
+				match++;
+				greedy = 0;
+			}
+
+			int _j = k;
+			while (_j < line->actual + 1) {
+				int _len;
+				if (!greedy && regex_matches(line, _j, match, ignorecase, &_len, needleout, refindex, refs)) {
+					if (len) *len = _len + _j - j;
+					return 1;
+				}
+				if (_j < line->actual && !matcher.matchFunc(&matcher, line->text[_j].codepoint, ignorecase)) break;
+				_j++;
+			}
+			if (!greedy) return 0;
+			while (_j >= k) {
+				int _len;
+				if (regex_matches(line, _j, match, ignorecase, &_len, needleout, refindex, refs)) {
+					if (len) *len = _len + _j - j;
+					return 1;
+				}
+				_j--;
+			}
+			return 0;
+		} else {
+			if (!matcher.matchFunc(&matcher, line->text[k].codepoint, ignorecase)) break;
+			k++;
 		}
-		if (k == line->actual) break;
-		if (!search_matches(*match, line->text[k].codepoint, ignorecase)) break;
-		match++;
-		k++;
 	}
 	return 0;
+}
+
+int subsearch_matches(line_t * line, int j, uint32_t * needle, int ignorecase, int *len) {
+	return regex_matches(line, j, needle, ignorecase, len, NULL, 0, NULL);
 }
 
 /**
  * Replace text on a given line with other text.
  */
-void perform_replacement(int line_no, uint32_t * needle, uint32_t * replacement, int col, int ignorecase, int *out_col) {
+void perform_replacement(int line_no, uint32_t * needle, uint32_t * replacement, int col, int ignorecase, int *out_col, int *line_out) {
 	line_t * line = env->lines[line_no-1];
 	int j = col;
 	while (j < line->actual + 1) {
 		int match_len;
-		if (subsearch_matches(line,j,needle,ignorecase,&match_len)) {
+		struct BackRef refs[MAX_REFS] = {0};
+		if (regex_matches(line,j,needle,ignorecase,&match_len,NULL,1,refs)) {
+			refs[0].start = j;
+			refs[0].len = match_len;
+			for (int i = 0; i < MAX_REFS; ++i) {
+				refs[i].copy = malloc(sizeof(uint32_t) * refs[i].len);
+				for (int j = 0; j < refs[i].len; ++j) {
+					refs[i].copy[j] = line->text[j+refs[i].start].codepoint;
+				}
+			}
+
 			/* Perform replacement */
 			for (int i = 0; i < match_len; ++i) {
 				line_delete(line, j+1, line_no-1);
@@ -4670,26 +4781,54 @@ void perform_replacement(int line_no, uint32_t * needle, uint32_t * replacement,
 			int t = 0;
 			for (uint32_t * r = replacement; *r; ++r) {
 				uint32_t rep = *r;
+				char_t _c;
+				_c.flags = 0;
+				line_t * nline = line;
 				if (*r == '\\' && r[1] == 't') {
 					rep = '\t';
 					++r;
 				} else if (*r == '\\' && (r[1] == '\\')) {
 					rep = r[1];
 					++r;
+				} else if (*r == '\\' && (r[1] >= '0' && r[1] <= '9')) {
+					int i = r[1] - '0';
+					++r;
+					nline = line;
+					for (int k = 0; k < refs[i].len; ++k) {
+						_c.codepoint = refs[i].copy[k];
+						_c.display_width = codepoint_width(refs[i].copy[k]);
+						nline = line_insert(nline, _c, j + t + k, line_no -1);
+					}
+					t += refs[i].len;
+					rep = 0;
+				} else if (*r == '\\' && (r[1] == 'n')) {
+					++r;
+					env->lines = split_line(env->lines, line_no - 1, j + t);
+					line_no++;
+					line = env->lines[line_no-1];
+					j = 0;
+					t = 0;
+					continue;
 				}
-				char_t _c;
-				_c.codepoint = rep;
-				_c.flags = 0;
-				_c.display_width = codepoint_width(rep);
-				line_t * nline = line_insert(line, _c, j + t, line_no -1);
+				if (rep) {
+					_c.codepoint = rep;
+					_c.display_width = codepoint_width(rep);
+					nline = line_insert(nline, _c, j + t, line_no -1);
+					t++;
+				}
 				if (line != nline) {
 					env->lines[line_no-1] = nline;
 					line = nline;
 				}
-				t++;
 			}
 			*out_col = j + t;
+			*line_out = line_no;
 			set_modified();
+
+			for (int i = 0; i < MAX_REFS; ++i) {
+				free(refs[i].copy);
+			}
+
 			return;
 		}
 		j++;
@@ -4699,6 +4838,7 @@ void perform_replacement(int line_no, uint32_t * needle, uint32_t * replacement,
 
 #define COMMAND_HISTORY_MAX 255
 unsigned char * command_history[COMMAND_HISTORY_MAX] = {NULL};
+unsigned char * search_history[COMMAND_HISTORY_MAX] = {NULL};
 
 /**
  * Add a command to the history. If that command was
@@ -4706,12 +4846,12 @@ unsigned char * command_history[COMMAND_HISTORY_MAX] = {NULL};
  * otherwise, the whole list is shifted backwards and
  * overflow is freed up.
  */
-void insert_command_history(char * cmd) {
+void insert_command_history(unsigned char ** which_history, char * cmd) {
 	/* See if this is already in the history. */
 	size_t amount_to_shift = COMMAND_HISTORY_MAX - 1;
-	for (int i = 0; i < COMMAND_HISTORY_MAX && command_history[i]; ++i) {
-		if (!strcmp((char*)command_history[i], cmd)) {
-			free(command_history[i]);
+	for (int i = 0; i < COMMAND_HISTORY_MAX && which_history[i]; ++i) {
+		if (!strcmp((char*)which_history[i], cmd)) {
+			free(which_history[i]);
 			amount_to_shift = i;
 			break;
 		}
@@ -4719,13 +4859,13 @@ void insert_command_history(char * cmd) {
 
 	/* Remove last entry that will roll off the stack */
 	if (amount_to_shift == COMMAND_HISTORY_MAX - 1) {
-		if (command_history[COMMAND_HISTORY_MAX-1]) free(command_history[COMMAND_HISTORY_MAX-1]);
+		if (which_history[COMMAND_HISTORY_MAX-1]) free(which_history[COMMAND_HISTORY_MAX-1]);
 	}
 
 	/* Roll the history */
-	memmove(&command_history[1], &command_history[0], sizeof(char *) * (amount_to_shift));
+	memmove(&which_history[1], &which_history[0], sizeof(char *) * (amount_to_shift));
 
-	command_history[0] = (unsigned char*)strdup(cmd);
+	which_history[0] = (unsigned char*)strdup(cmd);
 }
 
 static uint32_t term_colors[] = {
@@ -5188,10 +5328,19 @@ int replace_text(int range_top, int range_bot, char divider, char * needle) {
 	for (int line = range_top; line <= range_bot; ++line) {
 		int col = 0;
 		while (col != -1) {
-			perform_replacement(line, needle_c, replacement_c, col, case_insensitive, &col);
+			int _line = line;
+			perform_replacement(line, needle_c, replacement_c, col, case_insensitive, &col, &_line);
 			if (col != -1) replacements++;
+			if (_line > line) {
+				range_bot += _line - line;
+				line = _line;
+			}
 			if (!global) break;
 		}
+	}
+	if (env->mode == MODE_LINE_SELECTION) {
+		env->start_line = env->start_line < env->line_no ? range_top : range_bot;
+		env->line_no    = env->start_line < env->line_no ? range_bot : range_top;
 	}
 	free(needle_c);
 	free(replacement_c);
@@ -6490,24 +6639,6 @@ done:
 #define _syn_command() do { env->syntax = global_config.command_syn; } while (0)
 #define _syn_restore() do { env->syntax = global_config.command_syn_back; } while (0)
 
-#define _restore_history(point) do { \
-	unsigned char * t = command_history[point]; \
-	global_config.command_col_no = 1; \
-	global_config.command_buffer->actual = 0; \
-	_syn_command(); \
-	uint32_t state = 0; \
-	uint32_t c = 0; \
-	while (*t) { \
-		if (!decode(&state, &c, *t)) { \
-			char_t _c = {codepoint_width(c), 0, c}; \
-			global_config.command_buffer = line_insert(global_config.command_buffer, _c, global_config.command_col_no - 1, -1); \
-			global_config.command_col_no++; \
-		} else if (state == UTF8_REJECT) state = 0; \
-		t++; \
-	} \
-	_syn_restore(); \
-} while (0)
-
 /**
  * Draw the command buffer and any prefix.
  */
@@ -6620,10 +6751,7 @@ BIM_ACTION(enter_command, 0,
 	render_command_input_buffer();
 }
 
-BIM_ACTION(command_accept, 0,
-	"Accept the command input and run the requested command."
-)(void) {
-	/* Convert command buffer to UTF-8 char-array string */
+static char * command_buffer_to_utf8(void) {
 	size_t size = 0;
 	for (int i = 0; i < global_config.command_buffer->actual; ++i) {
 		char tmp[8] = {0};
@@ -6635,6 +6763,14 @@ BIM_ACTION(command_accept, 0,
 		t += to_eight(global_config.command_buffer->text[i].codepoint, t);
 	}
 	*t = '\0';
+	return tmp;
+}
+
+BIM_ACTION(command_accept, 0,
+	"Accept the command input and run the requested command."
+)(void) {
+	/* Convert command buffer to UTF-8 char-array string */
+	char * tmp = command_buffer_to_utf8();
 
 	/* Free the original editing buffer */
 	free(global_config.command_buffer);
@@ -6642,7 +6778,7 @@ BIM_ACTION(command_accept, 0,
 
 	/* Run the converted command */
 	global_config.break_from_selection = 0;
-	insert_command_history(tmp);
+	insert_command_history(command_history, tmp);
 	global_config.overlay_mode = OVERLAY_MODE_NONE;
 	process_command(tmp);
 	free(tmp);
@@ -6724,24 +6860,52 @@ BIM_ACTION(command_backspace, 0,
 	global_config.command_offset = 0;
 }
 
-BIM_ACTION(command_scroll_history, ARG_IS_CUSTOM,
-	"Scroll through command input history."
-)(int direction) {
+static void _restore_history(unsigned char **which_history, int point) {
+	unsigned char * t = which_history[point];
+	global_config.command_col_no = 1;
+	global_config.command_buffer->actual = 0;
+	_syn_command();
+	uint32_t state = 0;
+	uint32_t c = 0;
+	while (*t) {
+		if (!decode(&state, &c, *t)) {
+			char_t _c = {codepoint_width(c), 0, c};
+			global_config.command_buffer = line_insert(global_config.command_buffer, _c, global_config.command_col_no - 1, -1);
+			global_config.command_col_no++;
+		} else if (state == UTF8_REJECT) state = 0;
+		t++;
+	}
+	_syn_restore();
+}
+
+static void _scroll_history(int direction, unsigned char **which_history, int * which_point) {
 	if (direction == -1) {
-		if (command_history[global_config.history_point+1]) {
-			_restore_history(global_config.history_point+1);
-			global_config.history_point++;
+		if (which_history[*which_point+1]) {
+			_restore_history(which_history, *which_point+1);
+			(*which_point)++;
 		}
 	} else {
-		if (global_config.history_point > 0) {
-			global_config.history_point--;
-			_restore_history(global_config.history_point);
+		if (*which_point > 0) {
+			(*which_point)--;
+			_restore_history(which_history, *which_point);
 		} else {
-			global_config.history_point = -1;
+			*which_point = -1;
 			global_config.command_col_no = 1;
 			global_config.command_buffer->actual = 0;
 		}
 	}
+}
+
+BIM_ACTION(command_scroll_history, ARG_IS_CUSTOM,
+	"Scroll through command input history."
+)(int direction) {
+	_scroll_history(direction, command_history, &global_config.history_point);
+}
+
+BIM_ACTION(command_scroll_search_history, ARG_IS_CUSTOM,
+	"Scroll through search input history."
+)(int direction) {
+	_scroll_history(direction, search_history, &global_config.search_point);
 }
 
 BIM_ACTION(command_word_left, 0,
@@ -7062,6 +7226,10 @@ BIM_ACTION(search_accept, 0,
 		global_config.search[i] = global_config.command_buffer->text[i].codepoint;
 	}
 	global_config.search[global_config.command_buffer->actual] = 0;
+
+	char * tmp = command_buffer_to_utf8();
+	insert_command_history(search_history, tmp);
+	free(tmp);
 
 _finish:
 	/* Free the original editing buffer */
@@ -8618,6 +8786,18 @@ BIM_ACTION(insert_char_at_column, ARG_IS_INPUT | ACTION_IS_RW,
 	place_cursor_actual();
 }
 
+BIM_ACTION(insert_tab_at_column, ACTION_IS_RW,
+	"Insert an indentation character on multiple lines."
+)(void) {
+	if (env->tabs) {
+		insert_char_at_column('\t');
+	} else {
+		for (int i = 0; i < env->tabstop; ++i) {
+			insert_char_at_column(' ');
+		}
+	}
+}
+
 BIM_ACTION(enter_col_insert, ACTION_IS_RW,
 	"Enter column insert mode."
 )(void) {
@@ -9039,13 +9219,20 @@ _finish_completion:
  * some effort when trying to search for things we pulled from the outside world.
  * (eg., ctags search terms)
  */
-void set_search_from_bytes(char * bytes) {
+static void set_search_from_bytes(char * bytes) {
 	if (global_config.search) free(global_config.search);
-	global_config.search = malloc(sizeof(uint32_t) * (strlen(bytes) + 1));
+	global_config.search = malloc(sizeof(uint32_t) * (strlen(bytes) * 2 + 1));
 	uint32_t * s = global_config.search;
 	char * tmp = bytes;
 	uint32_t c, istate = 0;
 	while (*tmp) {
+		if (strchr("\\.()[]+*?", *tmp)) {
+			*s++ = '\\';
+			*s++ = *tmp;
+			*s = 0;
+			tmp++;
+			continue;
+		}
 		if (!decode(&istate, &c, *tmp)) {
 			*s = c;
 			s++;
@@ -9054,6 +9241,15 @@ void set_search_from_bytes(char * bytes) {
 			istate = 0;
 		}
 		tmp++;
+	}
+}
+
+static void _perform_correct_search(struct completion_match * matches, int i) {
+	if (matches[i].search[0] == '/') {
+		set_search_from_bytes(&matches[i].search[1]);
+		search_next();
+	} else {
+		goto_line(atoi(matches[i].search));
 	}
 }
 
@@ -9079,22 +9275,13 @@ BIM_ACTION(goto_definition, 0,
 		goto _done;
 	}
 
-#define _perform_correct_search(i) do { \
-		if (matches[i].search[0] == '/') { \
-			set_search_from_bytes(&matches[i].search[1]); \
-			search_next(); \
-		} else { \
-			goto_line(atoi(matches[i].search)); \
-		} \
-	} while (0)
-
 	if (env->file_name && !strcmp(matches[0].file, env->file_name)) {
-		_perform_correct_search(0);
+		_perform_correct_search(matches, 0);
 	} else {
 		/* Check if there were other matches that are in this file */
 		for (int i =1; env->file_name && i < matches_count; ++i) {
 			if (!strcmp(matches[i].file, env->file_name)) {
-				_perform_correct_search(i);
+				_perform_correct_search(matches, i);
 				goto _done;
 			}
 		}
@@ -9104,7 +9291,7 @@ BIM_ACTION(goto_definition, 0,
 				if (left_buffer && buffers[i] != left_buffer && buffers[i] != right_buffer) unsplit();
 				env = buffers[i];
 				redraw_tabbar();
-				_perform_correct_search(i);
+				_perform_correct_search(matches, i);
 				goto _done;
 			}
 		}
@@ -9112,7 +9299,7 @@ BIM_ACTION(goto_definition, 0,
 		buffer_t * old_buf = env;
 		open_file(matches[0].file);
 		if (env != old_buf) {
-			_perform_correct_search(0);
+			_perform_correct_search(matches, 0);
 		} else {
 			render_error("Could not locate file containing definition");
 		}
@@ -9703,6 +9890,7 @@ struct action_map _COL_INSERT_MAP[] = {
 	{KEY_ENTER,     NULL, 0, 0},
 	{KEY_CTRL_W,    NULL, 0, 0},
 	{KEY_CTRL_V,    insert_char_at_column, opt_char, 0},
+	{'\t',          insert_tab_at_column, 0, 0},
 	{KEY_LEFT,      column_left, 0, 0},
 	{KEY_RIGHT,     column_right, 0, 0},
 	{KEY_UP,        column_up, 0, 0},
@@ -9805,8 +9993,8 @@ struct action_map _FILESEARCH_MAP[] = {
 struct action_map _SEARCH_MAP[] = {
 	{KEY_ENTER,    search_accept, 0, 0},
 
-	{KEY_UP,       NULL, 0, 0},
-	{KEY_DOWN,     NULL, 0, 0},
+	{KEY_UP,        command_scroll_search_history, opt_arg, -1}, /* back */
+	{KEY_DOWN,      command_scroll_search_history, opt_arg, 1}, /* forward */
 
 	{-1, NULL, 0, 0}
 };
@@ -10188,7 +10376,7 @@ void normal_mode(void) {
 				}
 				refresh = 0;
 			} else if (handle_action(COL_INSERT_MAP, key)) {
-				/* pass */
+				refresh = 2;
 			} else if (key < KEY_ESCAPE) {
 				insert_char_at_column(key);
 				refresh = 1;

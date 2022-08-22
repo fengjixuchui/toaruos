@@ -15,6 +15,7 @@
 #include <sys/time.h>
 #include <sys/times.h>
 #include <sys/ptrace.h>
+#include <sys/signal.h>
 #include <syscall_nums.h>
 #include <kernel/printf.h>
 #include <kernel/process.h>
@@ -302,6 +303,7 @@ long sys_symlink(char * target, char * name) {
 
 long sys_readlink(const char * file, char * ptr, long len) {
 	PTR_VALIDATE(file);
+	PTRCHECK(ptr,len,0);
 	if (!file) return -EFAULT;
 	fs_node_t * node = kopen((char *) file, O_PATH | O_NOFOLLOW);
 	if (!node) {
@@ -944,12 +946,84 @@ long sys_pipe(int pipes[2]) {
 }
 
 long sys_signal(long signum, uintptr_t handler) {
-	if (signum > NUMSIGNALS) {
-		return -EINVAL;
-	}
-	uintptr_t old = this_core->current_process->signals[signum];
-	this_core->current_process->signals[signum] = handler;
+	if (signum > NUMSIGNALS) return -EINVAL;
+	if (signum == SIGKILL || signum == SIGSTOP) return -EINVAL;
+	uintptr_t old = this_core->current_process->signals[signum].handler;
+	this_core->current_process->signals[signum].handler = handler;
+	this_core->current_process->signals[signum].flags = SA_RESTART;
 	return old;
+}
+
+long sys_sigaction(int signum, struct sigaction *act, struct sigaction *oldact) {
+	if (act) PTRCHECK(act,sizeof(struct sigaction),0);
+	if (oldact) PTRCHECK(oldact,sizeof(struct sigaction),MMU_PTR_WRITE);
+
+	if (signum > NUMSIGNALS) return -EINVAL;
+	if (signum == SIGKILL || signum == SIGSTOP) return -EINVAL;
+
+	if (oldact) {
+		oldact->sa_handler = (_sig_func_ptr)this_core->current_process->signals[signum].handler;
+		oldact->sa_mask    = this_core->current_process->signals[signum].mask;
+		oldact->sa_flags   = this_core->current_process->signals[signum].flags;
+	}
+
+	if (act) {
+		this_core->current_process->signals[signum].handler = (uintptr_t)act->sa_handler;
+		this_core->current_process->signals[signum].mask    = act->sa_mask;
+		this_core->current_process->signals[signum].flags   = act->sa_flags;
+	}
+
+	return 0;
+}
+
+long sys_sigpending(sigset_t * set) {
+	PTRCHECK(set,sizeof(sigset_t),MMU_PTR_WRITE);
+	*set = this_core->current_process->pending_signals;
+	return 0;
+}
+
+long sys_sigprocmask(int how, sigset_t *restrict set, sigset_t * restrict oset) {
+	if (oset) {
+		PTRCHECK(oset,sizeof(sigset_t),MMU_PTR_WRITE);
+		*oset = this_core->current_process->blocked_signals;
+	}
+
+	if (set) {
+		PTRCHECK(set,sizeof(sigset_t),0);
+		switch (how) {
+			case SIG_SETMASK:
+				this_core->current_process->blocked_signals = *set;
+				break;
+			case SIG_BLOCK:
+				this_core->current_process->blocked_signals |= *set;
+				break;
+			case SIG_UNBLOCK:
+				this_core->current_process->blocked_signals &= ~*set;
+				break;
+			default:
+				return -EINVAL;
+		}
+	}
+
+	return 0;
+}
+
+long sys_sigsuspend_cur(void) {
+	switch_task(0);
+	return -EINTR;
+}
+
+long sys_sigwait(sigset_t * set, int * sig) {
+	PTRCHECK(set,sizeof(sigset_t),0);
+	PTRCHECK(sig,sizeof(int),MMU_PTR_WRITE);
+
+	/* Silently ignore attempts to wait on KILL or STOP */
+	sigset_t awaited = *set & ~((1 << SIGKILL) | (1 << SIGSTOP));
+
+	/* Don't let processes wait on unblocked signals */
+	if (awaited & ~this_core->current_process->blocked_signals) return -EINVAL;
+
+	return signal_await(awaited, sig);
 }
 
 long sys_fswait(int c, int fds[]) {
@@ -1159,6 +1233,11 @@ static long (*syscalls[])() = {
 	[SYS_TIMES]        = sys_times,
 	[SYS_PTRACE]       = ptrace_handle,
 	[SYS_SETTIMEOFDAY] = sys_settimeofday,
+	[SYS_SIGACTION]    = sys_sigaction,
+	[SYS_SIGPENDING]   = sys_sigpending,
+	[SYS_SIGPROCMASK]  = sys_sigprocmask,
+	[SYS_SIGSUSPEND]   = sys_sigsuspend_cur,
+	[SYS_SIGWAIT]      = sys_sigwait,
 
 	[SYS_SOCKET]       = net_socket,
 	[SYS_SETSOCKOPT]   = net_setsockopt,

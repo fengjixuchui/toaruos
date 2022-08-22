@@ -11,10 +11,10 @@
  * @copyright
  * This file is part of ToaruOS and is released under the terms
  * of the NCSA / University of Illinois License - see LICENSE.md
- * Copyright (C) 2013-2018 K. Lange
+ * Copyright (C) 2013-2022 K. Lange
  */
 #define _XOPEN_SOURCE 500
-#define _POSIX_C_SOURCE 200112L
+#define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
@@ -28,6 +28,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ctype.h>
+#include <wchar.h>
 
 #include <sys/time.h>
 #include <sys/times.h>
@@ -39,6 +40,7 @@
 #include <toaru/hashmap.h>
 #include <toaru/kbd.h>
 #include <toaru/rline.h>
+#include <toaru/decodeutf8.h>
 
 #ifndef environ
 extern char **environ;
@@ -174,6 +176,23 @@ void gethost() {
 	memcpy(_hostname, buf.nodename, len+1);
 }
 
+int display_width_of_string(const char * str) {
+	uint8_t * s = (uint8_t *)str;
+
+	int out = 0;
+	uint32_t c, state = 0;
+	while (*s) {
+		if (!decode(&state, &c, *s)) {
+			out += wcwidth(c);
+		} else if (state == UTF8_REJECT) {
+			state = 0;
+		}
+		s++;
+	}
+
+	return out;
+}
+
 void print_extended_ps(char * format, char * buffer, int * display_width) {
 	/* Get the time */
 	struct tm * timeinfo;
@@ -208,7 +227,8 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 
 	size_t offset = 0;
 	int is_visible = 1;
-	*display_width = 0;
+	char dispchars[1024] = {0};
+	char * dispout = dispchars;
 
 	while (*format) {
 		if (*format == '\\') {
@@ -216,7 +236,7 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 			switch (*format) {
 				case '\\':
 					buffer[offset++] = *format;
-					(*display_width) += is_visible ? 1 : 0;
+					if (is_visible) *dispout++ = *format;
 					format++;
 					break;
 				case '[':
@@ -249,19 +269,19 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 							}
 						}
 						buffer[offset++] = i;
-						(*display_width) += is_visible ? 1 : 0;
+						if (is_visible) *dispout++ = i;
 					}
 					break;
 				case 'e':
 					buffer[offset++] = '\033';
-					(*display_width) += is_visible ? 1 : 0;
+					if (is_visible) *dispout++ = '\033';
 					format++;
 					break;
 				case 'd':
 					{
 						int size = sprintf(buffer+offset, "%s", date_buffer);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", date_buffer); }
 					}
 					format++;
 					break;
@@ -269,7 +289,7 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "%s", time_buffer);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", time_buffer); }
 					}
 					format++;
 					break;
@@ -277,7 +297,7 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "%s", _hostname);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", _hostname); }
 					}
 					format++;
 					break;
@@ -285,7 +305,7 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "%s", username);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", username); }
 					}
 					format++;
 					break;
@@ -293,13 +313,13 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "%s", _cwd);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", _cwd); }
 					}
 					format++;
 					break;
 				case '$':
 					buffer[offset++] = (getuid() == 0 ? '#' : '$');
-					(*display_width) += is_visible ? 1 : 0;
+					if (is_visible) *dispout++ = (getuid() == 0 ? '#' : '$');
 					format++;
 					break;
 				case 'U': /* prompt color string */
@@ -314,7 +334,7 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "%s", ret);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "%s", ret); }
 					}
 					format++;
 					break;
@@ -322,36 +342,27 @@ void print_extended_ps(char * format, char * buffer, int * display_width) {
 					{
 						int size = sprintf(buffer+offset, "\\%c", *format);
 						offset += size;
-						(*display_width) += is_visible ? size : 0;
+						if (is_visible) { dispout += sprintf(dispout, "\\%c", *format); }
 					}
 					format++;
 					break;
 			}
 		} else {
 			buffer[offset++] = *format;
-			(*display_width) += is_visible ? 1 : 0;
+			if (is_visible) *dispout++ = *format;
 			format++;
 		}
 	}
 
+	*display_width = display_width_of_string(dispchars);
+
 	buffer[offset] = '\0';
-}
-
-#define FALLBACK_PS1 "\\u@\\h \\w\\$ "
-
-/* Draw the user prompt */
-void draw_prompt(void) {
-	char * ps1 = getenv("PS1");
-	char buf[1024];
-	int display_width;
-	print_extended_ps(ps1 ? ps1 : FALLBACK_PS1, buf, &display_width);
-	fprintf(stdout, "%s", buf);
-	fflush(stdout);
 }
 
 volatile int break_while = 0;
 pid_t suspended_pgid = 0;
 hashmap_t * job_hash = NULL;
+hashmap_t * desc_hash = NULL;
 
 void sig_break_loop(int sig) {
 	/* Interrupt handler */
@@ -711,6 +722,7 @@ void add_environment(list_t * env) {
 	}
 }
 
+#define FALLBACK_PS1 "\\u@\\h \\w\\$ "
 int read_entry(char * buffer) {
 	char lprompt[1024], rprompt[1024];
 	int lwidth, rwidth;
@@ -779,7 +791,6 @@ static struct alternative cmd_alternatives[] = {
 	{"ip", ALT_NETIF},
 
 	/* Some random other stuff */
-	{"grep", "fgrep", "non-regex-capable grep"},
 	{"more", "bim -", "paging to a text editor"},
 	{"less", "bim -", "paging to a text editor"},
 
@@ -828,55 +839,17 @@ int is_number(const char * c) {
 	return 1;
 }
 
-static char * _strsignal(int sig) {
-	static char str[256];
-	memset(str, 0, sizeof(str));
-	switch (sig) {
-		case SIGILL:
-			sprintf(str, "Illegal instruction");
-			break;
-		case SIGSEGV:
-			sprintf(str, "Segmentation fault");
-			break;
-		case SIGTERM:
-			sprintf(str, "Terminated");
-			break;
-		case SIGQUIT:
-			sprintf(str, "Quit");
-			break;
-		case SIGKILL:
-			sprintf(str, "Killed");
-			break;
-		case SIGHUP:
-			sprintf(str, "Hangup");
-			break;
-		case SIGUSR1:
-			sprintf(str, "User defined signal 1");
-			break;
-		case SIGUSR2:
-			sprintf(str, "User defined signal 2");
-			break;
-		case SIGINT:
-			sprintf(str, "Interrupt");
-			break;
-		case SIGPIPE:
-			sprintf(str, "Broken pipe");
-			break;
-		default:
-			sprintf(str, "Killed by unhandled signal %d",sig);
-			break;
-	}
-	return str;
-}
-
 /**
  * Prints "Segmentation fault", etc.
  */
 static void handle_status(int ret_code) {
 	if (WIFSIGNALED(ret_code)) {
 		int sig = WTERMSIG(ret_code);
-		if (sig == SIGINT || sig == SIGPIPE) return;
-		char * str = _strsignal(sig);
+		if (sig == SIGINT || sig == SIGPIPE) {
+			fprintf(stderr, "\n");
+			return;
+		}
+		char * str = strsignal(sig);
 		if (shell_interactive == 1) {
 			fprintf(stderr, "%s\n", str);
 		} else if (shell_interactive == 2) {
@@ -885,12 +858,15 @@ static void handle_status(int ret_code) {
 	}
 }
 
+static void describe_job(pid_t pid);
+
 int wait_for_child(int pgid, char * name, int retpid) {
 	int waitee = (shell_interactive == 1 && !is_subshell) ? -pgid : pgid;
 	int outpid;
 	int ret_code = 0;
 	int ret_code_real = 0;
 	int e;
+	int _stopped = 0;
 
 	do {
 		outpid = waitpid(waitee, &ret_code, WSTOPPED);
@@ -901,19 +877,27 @@ int wait_for_child(int pgid, char * name, int retpid) {
 		if (WIFSTOPPED(ret_code)) {
 			suspended_pgid = pgid;
 			if (name) {
-				hashmap_set(job_hash, (void*)(intptr_t)pgid, strdup(name));
+				void * old = hashmap_set(job_hash, (void*)(intptr_t)pgid, strdup(name));
+				if (old) free(old);
 			}
-			fprintf(stderr, "[%d] Stopped\t\t%s\n", pgid, (char*)hashmap_get(job_hash, (void*)(intptr_t)pgid));
+			void * old = hashmap_set(desc_hash, (void*)(intptr_t)pgid, strdup(WSTOPSIG(ret_code) ? strsignal(WSTOPSIG(ret_code)) : "Stopped"));
+			if (old) free(old);
+			_stopped = 1;
 			break;
 		} else {
 			suspended_pgid = 0;
 			if (hashmap_has(job_hash, (void*)(intptr_t)pgid)) {
 				hashmap_remove(job_hash, (void*)(intptr_t)pgid);
+				hashmap_remove(desc_hash, (void*)(intptr_t)pgid);
 			}
 		}
 	} while (outpid != -1 || (outpid == -1 && e != ECHILD));
 	reset_pgrp();
 	handle_status(ret_code_real);
+	if (_stopped && shell_interactive) {
+		fprintf(stderr, "\n");
+		describe_job(pgid);
+	}
 	return WEXITSTATUS(ret_code_real);
 }
 
@@ -1701,6 +1685,7 @@ int main(int argc, char ** argv) {
 	srand(getpid() + time(0));
 
 	job_hash = hashmap_create_int(10);
+	desc_hash = hashmap_create_int(10);
 
 	getuser();
 	gethost();
@@ -1768,13 +1753,13 @@ int main(int argc, char ** argv) {
 			int pid = (intptr_t)node->value;
 			int status = 0;
 			if (waitpid(-pid, &status, WNOHANG) > 0) {
-				char * desc = "Done";
-				if (WTERMSIG(status) != 0) {
-					desc = _strsignal(WTERMSIG(status));
-				}
-				fprintf(stderr, "[%d] %s\t\t%s\n", pid, desc, (char*)hashmap_get(job_hash, (void*)(intptr_t)pid));
+				char * desc = strdup(WTERMSIG(status) ? strsignal(WTERMSIG(status)) : "Done");
+				void * old = hashmap_set(desc_hash, (void*)(intptr_t)pid, desc);
+				if (old) free(old);
+				describe_job(pid);
 				if (hashmap_has(job_hash, (void*)(intptr_t)pid)) {
 					hashmap_remove(job_hash, (void*)(intptr_t)pid);
+					hashmap_remove(desc_hash, (void*)(intptr_t)pid);
 				}
 			}
 		}
@@ -2231,11 +2216,16 @@ uint32_t shell_cmd_fg(int argc, char * argv[]) {
 		fprintf(stderr, "no current job / bad pid\n");
 		if (hashmap_has(job_hash, (void*)(intptr_t)pid)) {
 			hashmap_remove(job_hash, (void*)(intptr_t)pid);
+			hashmap_remove(desc_hash, (void*)(intptr_t)pid);
 		}
 		return 1;
 	}
 
 	return wait_for_child(pid, NULL, pid);
+}
+
+static void describe_job(pid_t pid) {
+	fprintf(stderr, "[%d] %s\t\t%s\n", pid, (char*)hashmap_get(desc_hash, (void*)(intptr_t)pid), (char*)hashmap_get(job_hash, (void*)(intptr_t)pid));
 }
 
 uint32_t shell_cmd_bg(int argc, char * argv[]) {
@@ -2249,11 +2239,12 @@ uint32_t shell_cmd_bg(int argc, char * argv[]) {
 		fprintf(stderr, "no current job / bad pid\n");
 		if (hashmap_has(job_hash, (void*)(intptr_t)pid)) {
 			hashmap_remove(job_hash, (void*)(intptr_t)pid);
+			hashmap_remove(desc_hash, (void*)(intptr_t)pid);
 		}
 		return 1;
 	}
 
-	fprintf(stderr, "[%d] %s\n", pid, (char*)hashmap_get(job_hash, (void*)(intptr_t)pid));
+	describe_job(pid);
 	return 0;
 }
 
@@ -2261,8 +2252,7 @@ uint32_t shell_cmd_jobs(int argc, char * argv[]) {
 	list_t * keys = hashmap_keys(job_hash);
 	foreach(node, keys) {
 		int pid = (intptr_t)node->value;
-		char * c = hashmap_get(job_hash, (void*)(intptr_t)pid);
-		fprintf(stdout, "%5d %s\n", pid, c);
+		describe_job(pid);
 	}
 	list_free(keys);
 	free(keys);
