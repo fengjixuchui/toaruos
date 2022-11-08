@@ -55,6 +55,7 @@ long sys_sbrk(ssize_t size) {
 	if (proc->group != 0) {
 		proc = process_from_pid(proc->group);
 	}
+	if (!proc) return -EINVAL;
 	spin_lock(proc->image.lock);
 	uintptr_t out = proc->image.heap;
 	for (uintptr_t i = out; i < out + size; i += 0x1000) {
@@ -110,7 +111,12 @@ long sys_sysfunc(long fn, char ** args) {
 			extern void mmu_unmap_user(uintptr_t addr, size_t size);
 			PTR_VALIDATE(&args[0]);
 			PTR_VALIDATE(&args[1]);
+			volatile process_t * volatile proc = this_core->current_process;
+			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
+			spin_lock(proc->image.lock);
 			mmu_unmap_user((uintptr_t)args[0], (size_t)args[1]);
+			spin_unlock(proc->image.lock);
 			return 0;
 		}
 
@@ -135,6 +141,7 @@ long sys_sysfunc(long fn, char ** args) {
 			if (!args[0]) return -EFAULT;
 			volatile process_t * volatile proc = this_core->current_process;
 			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
 			spin_lock(proc->image.lock);
 			proc->image.heap = (uintptr_t)args[0];
 			spin_unlock(proc->image.lock);
@@ -149,6 +156,7 @@ long sys_sysfunc(long fn, char ** args) {
 			if (!args) return -EFAULT;
 			volatile process_t * volatile proc = this_core->current_process;
 			if (proc->group != 0) proc = process_from_pid(proc->group);
+			if (!proc) return -EFAULT;
 			spin_lock(proc->image.lock);
 			/* Align inputs */
 			uintptr_t start = ((uintptr_t)args[0]) & 0xFFFFffffFFFFf000UL;
