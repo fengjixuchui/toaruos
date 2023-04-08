@@ -761,7 +761,7 @@ static inline uint32_t gfx_bilinear_interpolation(const sprite_t * tex, double u
 	uint32_t ur = out_of_bounds(tex,x+1,y)   ? 0 : SPRITE(tex,x+1,y);
 	uint32_t ll = out_of_bounds(tex,x,y+1)   ? 0 : SPRITE(tex,x,y+1);
 	uint32_t lr = out_of_bounds(tex,x+1,y+1) ? 0 : SPRITE(tex,x+1,y+1);
-	if ((ul | ul | ll | lr) == 0) return 0;
+	if ((ul | ur | ll | lr) == 0) return 0;
 	uint8_t u_ratio = (u - x) * 0xFF;
 	uint8_t v_ratio = (v - y) * 0xFF;
 	uint32_t top = linear_interp(ul,ur,u_ratio);
@@ -852,6 +852,10 @@ static void apply_matrix(double x, double y, gfx_matrix_t matrix, double *out_x,
 	*out_y = matrix[1][0] * x + matrix[1][1] * y + matrix[1][2];
 }
 
+void gfx_apply_matrix(double x, double y, gfx_matrix_t matrix, double *out_x, double *out_y) {
+	apply_matrix(x,y,matrix,out_x,out_y);
+}
+
 static void multiply_matrix(gfx_matrix_t x, gfx_matrix_t y) {
 	double a = x[0][0];
 	double b = x[0][1];
@@ -889,6 +893,13 @@ void gfx_matrix_scale(gfx_matrix_t matrix, double x, double y) {
 	multiply_matrix(matrix, (gfx_matrix_t){
 		{x, 0.0, 0.0},
 		{0.0, y, 0.0},
+	});
+}
+
+void gfx_matrix_shear(gfx_matrix_t matrix, double x, double y) {
+	multiply_matrix(matrix, (gfx_matrix_t){
+		{1.0, x, 0.0},
+		{y, 1.0, 0.0},
 	});
 }
 
@@ -971,12 +982,25 @@ void draw_sprite_transform(gfx_context_t * ctx, const sprite_t * sprite, gfx_mat
 	sprite_t * scanline = create_sprite(_right - _left, 1, ALPHA_EMBEDDED);
 	uint8_t alp = alpha * 255;
 
+	double filter_x, filter_y, filter_dxx, filter_dxy, filter_dyx, filter_dyy;
+	gfx_apply_matrix(_left, _top, inverse, &filter_x, &filter_y);
+	gfx_apply_matrix(_left+1, _top, inverse, &filter_dxx, &filter_dxy);
+	filter_dxx -= filter_x;
+	filter_dxy -= filter_y;
+	gfx_apply_matrix(_left, _top+1, inverse, &filter_dyx, &filter_dyy);
+	filter_dyx -= filter_x;
+	filter_dyy -= filter_y;
+
 	for (int32_t _y = _top; _y < _bottom; ++_y) {
+		float u = filter_x;
+		float v = filter_y;
+		filter_x += filter_dyx;
+		filter_y += filter_dyy;
 		if (!_is_in_clip(ctx, _y)) continue;
 		for (int32_t _x = _left; _x < _right; ++_x) {
-			double u, v;
-			apply_matrix(_x, _y, inverse, &u, &v);
 			SPRITE(scanline,_x - _left,0) = gfx_bilinear_interpolation(sprite, u, v);
+			u += filter_dxx;
+			v += filter_dxy;
 		}
 		apply_alpha_vector(scanline->bitmap, scanline->width, alp);
 		draw_sprite(ctx,scanline,_left,_y);
@@ -1026,13 +1050,26 @@ void draw_sprite_transform_blur(gfx_context_t * ctx, gfx_context_t * blur_ctx, c
 	sprite_t * blurline = create_sprite(_right - _left, 1, ALPHA_EMBEDDED);
 	uint8_t alp = alpha * 255;
 
+	double filter_x, filter_y, filter_dxx, filter_dxy, filter_dyx, filter_dyy;
+	gfx_apply_matrix(_left, _top, inverse, &filter_x, &filter_y);
+	gfx_apply_matrix(_left+1, _top, inverse, &filter_dxx, &filter_dxy);
+	filter_dxx -= filter_x;
+	filter_dxy -= filter_y;
+	gfx_apply_matrix(_left, _top+1, inverse, &filter_dyx, &filter_dyy);
+	filter_dyx -= filter_x;
+	filter_dyy -= filter_y;
+
 	for (int32_t _y = _top; _y < _bottom; ++_y) {
+		float u = filter_x;
+		float v = filter_y;
+		filter_x += filter_dyx;
+		filter_y += filter_dyy;
 		if (!_is_in_clip(ctx, _y)) continue;
 		for (int32_t _x = _left; _x < _right; ++_x) {
-			double u, v;
-			apply_matrix(_x, _y, inverse, &u, &v);
 			SPRITE(scanline,_x - _left,0) = gfx_bilinear_interpolation(sprite, u, v);
 			SPRITE(blurline,_x - _left,0) = (_ALP(SPRITE(scanline,_x - _left,0)) > threshold) ? GFX(blur_ctx,_x,_y) : 0;
+			u += filter_dxx;
+			v += filter_dxy;
 		}
 		apply_alpha_vector(blurline->bitmap, blurline->width, alp);
 		apply_alpha_vector(scanline->bitmap, scanline->width, alp);
